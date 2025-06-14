@@ -116,7 +116,7 @@ class BPE:
                 new_pairs = new_pairs | self.byte_word_list[idx].merge(key, new_id, self.pair_hash)
             for pair in new_pairs:
                 heapq.heappush(heap, QueueItem(self.pair_hash[pair].freq, pair, (self.vocab[pair[0]], self.vocab[pair[1]])))
-            if len(self.merge_list) % 1000 == 0:
+            if len(self.merge_list) % 100 == 0:
                 print(f'{len(self.merge_list)} / {num_merges}')
         for w in self.special_tokens:
             self.vocab[len(self.vocab)] = w.encode('utf-8')
@@ -133,7 +133,7 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str])  \
         -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]] :
         ## Usage
     bpe = BPE(vocab_size, special_tokens)
-    num_processes = 100
+    num_processes = 16
     with open(input_path, "rb") as f:
         print("Pretokenize")
         boundaries = find_chunk_boundaries(
