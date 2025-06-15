@@ -145,44 +145,50 @@ if __name__ == '__main__':
     owt_valid_ids = []
     
     # Process TinyStories datasets using multiprocessing
-    print("Encoding TinyStories datasets...")
+    num_processes = 32
     
-    def encode_chunk(chunk):
+    def tiny_encode_chunk(chunk):
         return tiny_tokenizer.encode(chunk)
+    def owt_encode_chunk(chunk):
+        return owt_tokenizer.encode(chunk)
     
-    # Process train data
+    print("Encoding TinyStories train data...")
     with Pool() as pool:
         tiny_train_ids = []
-        for chunk_ids in pool.imap(encode_chunk, read_file_in_chunks('data/TinyStoriesV2-GPT4-train.txt')):
+        for chunk_ids in pool.imap(tiny_encode_chunk, read_file_in_chunks('data/TinyStoriesV2-GPT4-train.txt', num_processes)):
             tiny_train_ids.extend(chunk_ids)
-    
-    # Process dev data
+    tiny_train_ids = np.array(tiny_train_ids, dtype=np.uint16)
+    print(f"#Tokens: {len(tiny_train_ids)}")
+    np.save('data/tiny_train_ids.npy', tiny_train_ids)
+    del tiny_train_ids
+
+    print("Encoding TinyStories valid data...")
     with Pool() as pool:
         tiny_valid_ids = []
-        for chunk_ids in pool.imap(encode_chunk, read_file_in_chunks('data/TinyStoriesV2-GPT4-valid.txt')):
+        for chunk_ids in pool.imap(tiny_encode_chunk, read_file_in_chunks('data/TinyStoriesV2-GPT4-valid.txt', num_processes)):
             tiny_valid_ids.extend(chunk_ids)
-    
-    # Process OpenWebText datasets
-    print("Encoding OpenWebText datasets...")
+    tiny_valid_ids = np.array(tiny_valid_ids, dtype=np.uint16)
+    print(f"#Tokens: {len(tiny_valid_ids)}")
+    np.save('data/tiny_valid_ids.npy', tiny_valid_ids)
+    del tiny_valid_ids
+
+    print("Encoding OpenWebText train data...")
     with Pool() as pool:
         owt_train_ids = []
-        for chunk_ids in pool.imap(encode_chunk, read_file_in_chunks('data/owt_train.txt')):
+        for chunk_ids in pool.imap(owt_encode_chunk, read_file_in_chunks('data/owt_train.txt', num_processes)):
             owt_train_ids.extend(chunk_ids)
-    
+    owt_train_ids = np.array(owt_train_ids, dtype=np.uint16)
+    print(f"#Tokens: {len(owt_train_ids)}")
+    np.save('data/owt_train_ids.npy', owt_train_ids)
+    del owt_train_ids
+
+    print("Encoding OpenWebText valid data...")
     with Pool() as pool:
         owt_valid_ids = []
-        for chunk_ids in pool.imap(encode_chunk, read_file_in_chunks('data/owt_dev.txt')):
+        for chunk_ids in pool.imap(owt_encode_chunk, read_file_in_chunks('data/owt_valid.txt', num_processes)):
             owt_valid_ids.extend(chunk_ids)
-    
-    # Convert to numpy arrays with uint16 dtype
-    tiny_train_ids = np.array(tiny_train_ids, dtype=np.uint16)
-    tiny_valid_ids = np.array(tiny_valid_ids, dtype=np.uint16)
-    owt_train_ids = np.array(owt_train_ids, dtype=np.uint16)
     owt_valid_ids = np.array(owt_valid_ids, dtype=np.uint16)
-    
-    # Save the encoded datasets
-    np.save('data/tiny_train_ids.npy', tiny_train_ids)
-    np.save('data/tiny_valid_ids.npy', tiny_valid_ids)
-    np.save('data/owt_train_ids.npy', owt_train_ids)
+    print(f"#Tokens: {len(owt_valid_ids)}")
     np.save('data/owt_valid_ids.npy', owt_valid_ids)
+    del owt_valid_ids
     

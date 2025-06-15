@@ -1,3 +1,5 @@
+pip install uv numpy regex
+
 mkdir -p data
 cd data
 
@@ -13,3 +15,5 @@ cd ..
 
 git config --global user.email liu_yuda@163.com
 git config --global user.name lengly
+
+export PYTHONPATH=./
