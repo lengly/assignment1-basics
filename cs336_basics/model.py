@@ -59,3 +59,39 @@ class SwiGLU(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w2(self.silu(self.w1(x)) * self.w3(x))
+
+class RoPE(nn.Module):
+    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None):
+        super().__init__()
+        freqs = 1 / (theta ** (torch.arange(0, d_k, 2)[: (d_k // 2)].float() / d_k))
+        t = torch.arange(max_seq_len, device=freqs.device)
+        freqs_cis = torch.outer(t, freqs).to(device)
+        self.register_buffer("cos_cache", torch.cos(freqs_cis), persistent=False, device=device)
+        self.register_buffer("sin_cache", torch.sin(freqs_cis), persistent=False, device=device)
+
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
+        # x shape: (..., seq_len, d_k)
+        # token_positions shape: (..., seq_len)
+        seq_len = x.shape[-2]
+        cos = self.cos_cache[token_positions].to(x.device)
+        sin = self.sin_cache[token_positions].to(x.device)
+        x_reshaped = x.view(*x.shape[:-1], -1, 2)
+        x_even = x_reshaped[..., 0]
+        x_odd = x_reshaped[..., 1]
+        x_rotated_even = x_even * cos - x_odd * sin
+        x_rotated_odd = x_even * sin + x_odd * cos
+        x_rotated = torch.stack([x_rotated_even, x_rotated_odd], dim=-1)
+        x_rotated = x_rotated.view(x.shape)
+        return x_rotated
+
+class Softmax(nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, x: torch.Tensor, dim: int) -> torch.Tensor:
+        max_x = torch.max(x, dim=dim, keepdim=True).values
+        exp_x = torch.exp(x - max_x)
+        return exp_x / exp_x.sum(dim=dim, keepdim=True)
+
+
+
