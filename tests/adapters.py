@@ -12,6 +12,7 @@ from torch import Tensor
 from cs336_basics import bpe
 from cs336_basics.tokenizer import Tokenizer
 import cs336_basics.model as model
+import cs336_basics.utils as utils
 
 def run_linear(
     d_in: int,
@@ -478,7 +479,7 @@ def run_cross_entropy(inputs: Float[Tensor, " batch_size vocab_size"], targets: 
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+    return utils.stable_cross_entropy(inputs, targets)
 
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
@@ -490,14 +491,14 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    utils.gradient_clipping(parameters, max_l2_norm)
 
 
 def get_adamw_cls() -> type[torch.optim.Optimizer]:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    return utils.AdamW
 
 
 def run_get_lr_cosine_schedule(
@@ -525,7 +526,7 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    return utils.cosine_cycle_schedule(it, warmup_iters, cosine_cycle_iters, min_learning_rate, max_learning_rate)
 
 
 def run_save_checkpoint(
