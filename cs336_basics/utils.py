@@ -1,5 +1,8 @@
+import os
+import typing
 import torch
 import torch.nn as nn
+import numpy.typing as npt
 from collections.abc import Callable, Iterable
 from typing import Optional
 import torch
@@ -118,6 +121,41 @@ def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: flo
             if param.grad is None:
                 continue
             param.grad.data.mul_(clip_coef)
+
+def get_batch(dataset: npt.NDArray, batch_size: int, context_length: int, device: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Given a dataset (a 1D numpy array of integers) and a desired batch size and
+    context length, sample language modeling input sequences and their corresponding
+    labels from the dataset.
+    """
+    assert len(dataset) >= context_length, "Dataset too small"
+    # Randomly sample a batch of indices
+    batch_indices = torch.randint(0, len(dataset) - context_length, (batch_size,))
+    # Get the input sequences and labels
+    inputs = torch.stack([torch.from_numpy(dataset[i:i+context_length]) for i in batch_indices])
+    labels = torch.stack([torch.from_numpy(dataset[i+1:i+context_length+1]) for i in batch_indices])
+    return inputs.to(device), labels.to(device)
+
+def save_checkpoint(model: torch.nn.Module, optimizer: torch.optim.Optimizer, iteration: int, out: str | os.PathLike | typing.BinaryIO | typing.IO[bytes]):
+    """
+    Save a checkpoint of the model and optimizer.
+    """
+    torch.save({
+        'iteration': iteration,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+    }, out)
+    print(f"Saved checkpoint to {out}")
+    
+def load_checkpoint(src: str | os.PathLike | typing.BinaryIO | typing.IO[bytes], model: torch.nn.Module, optimizer: torch.optim.Optimizer):
+    """
+    Load a checkpoint of the model and optimizer.
+    """
+    checkpoint = torch.load(src)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    print(f"Loaded checkpoint from {src}")
+    return checkpoint['iteration']
 
 if __name__ == "__main__":
     for lr in [1e1, 1e2, 1e3]:

@@ -1,0 +1,510 @@
+#!/usr/bin/env python3
+"""
+Training script for CS336 Transformer Language Model.
+
+This script provides a complete training pipeline with:
+- Configurable hyperparameters
+- Memory-efficient data loading with np.memmap
+- Checkpoint serialization
+- Logging with Weights & Biases support
+- Training and validation loops
+"""
+
+import argparse
+import json
+import logging
+import os
+import sys
+from pathlib import Path
+from typing import Dict, Any, Optional, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
+import wandb
+from tqdm import tqdm
+
+from .model import TransformerLM
+from .tokenizer import Tokenizer
+from .utils import (
+    stable_cross_entropy,
+    perplexity_from_loss,
+    get_batch,
+    save_checkpoint,
+    load_checkpoint,
+    AdamW,
+    gradient_clipping,
+    cosine_cycle_schedule
+)
+
+
+class MemmapDataset(Dataset):
+    """Memory-efficient dataset using numpy memmap for large datasets."""
+    
+    def __init__(self, data_path: str, context_length: int):
+        """
+        Initialize dataset with memmap loading.
+        
+        Args:
+            data_path: Path to the tokenized data file (.npy)
+            context_length: Length of context window for language modeling
+        """
+        self.data_path = data_path
+        self.context_length = context_length
+        
+        # Load data using memmap for memory efficiency
+        self.data = np.load(data_path, mmap_mode='r')
+        self.length = len(self.data) - context_length
+        
+        logging.info(f"Loaded dataset from {data_path}")
+        logging.info(f"Dataset size: {len(self.data)} tokens")
+        logging.info(f"Number of training sequences: {self.length}")
+    
+    def __len__(self):
+        return self.length
+    
+    def __getitem__(self, idx):
+        # Get input sequence and target sequence
+        input_seq = self.data[idx:idx + self.context_length]
+        target_seq = self.data[idx + 1:idx + self.context_length + 1]
+        
+        return torch.from_numpy(input_seq).long(), torch.from_numpy(target_seq).long()
+
+
+class TrainingConfig:
+    """Configuration class for training hyperparameters."""
+    
+    def __init__(self, **kwargs):
+        # Model hyperparameters
+        self.vocab_size = kwargs.get('vocab_size', 50257)
+        self.context_length = kwargs.get('context_length', 1024)
+        self.num_layers = kwargs.get('num_layers', 12)
+        self.d_model = kwargs.get('d_model', 768)
+        self.num_heads = kwargs.get('num_heads', 12)
+        self.d_ff = kwargs.get('d_ff', 3072)
+        self.rope_theta = kwargs.get('rope_theta', 10000.0)
+        
+        # Training hyperparameters
+        self.batch_size = kwargs.get('batch_size', 32)
+        self.learning_rate = kwargs.get('learning_rate', 1e-4)
+        self.weight_decay = kwargs.get('weight_decay', 0.1)
+        self.max_epochs = kwargs.get('max_epochs', 10)
+        self.gradient_clip_norm = kwargs.get('gradient_clip_norm', 1.0)
+        self.warmup_steps = kwargs.get('warmup_steps', 1000)
+        self.total_steps = kwargs.get('total_steps', 100000)
+        
+        # Data paths
+        self.train_data_path = kwargs.get('train_data_path', 'data/train_tokens.npy')
+        self.val_data_path = kwargs.get('val_data_path', 'data/val_tokens.npy')
+        self.tokenizer_vocab_path = kwargs.get('tokenizer_vocab_path', 'bpe_result/tiny/vocab.pkl')
+        self.tokenizer_merges_path = kwargs.get('tokenizer_merges_path', 'bpe_result/tiny/merge.pkl')
+        
+        # Checkpoint and logging
+        self.checkpoint_dir = kwargs.get('checkpoint_dir', 'checkpoints')
+        self.checkpoint_interval = kwargs.get('checkpoint_interval', 1000)
+        self.log_interval = kwargs.get('log_interval', 100)
+        self.eval_interval = kwargs.get('eval_interval', 1000)
+        
+        # Device and precision
+        self.device = kwargs.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
+        self.dtype = kwargs.get('dtype', torch.float32)
+        
+        # Weights & Biases
+        self.use_wandb = kwargs.get('use_wandb', False)
+        self.wandb_project = kwargs.get('wandb_project', 'cs336-transformer')
+        self.wandb_run_name = kwargs.get('wandb_run_name', None)
+        
+        # Resume training
+        self.resume_from = kwargs.get('resume_from', None)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert config to dictionary for logging."""
+        return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
+    
+    @classmethod
+    def from_file(cls, config_path: str) -> 'TrainingConfig':
+        """Load configuration from JSON file."""
+        with open(config_path, 'r') as f:
+            config_dict = json.load(f)
+        return cls(**config_dict)
+    
+    def save(self, config_path: str):
+        """Save configuration to JSON file."""
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+        with open(config_path, 'w') as f:
+            json.dump(self.to_dict(), f, indent=2)
+
+
+class Trainer:
+    """Main training class."""
+    
+    def __init__(self, config: TrainingConfig):
+        self.config = config
+        self.device = torch.device(config.device)
+        self.dtype = config.dtype
+        
+        # Setup logging
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler('training.log'),
+                logging.StreamHandler(sys.stdout)
+            ]
+        )
+        
+        # Initialize model, tokenizer, and datasets
+        self._setup_model()
+        self._setup_tokenizer()
+        self._setup_datasets()
+        self._setup_optimizer()
+        
+        # Training state
+        self.global_step = 0
+        self.epoch = 0
+        self.best_val_loss = float('inf')
+        
+        # Setup Weights & Biases
+        if config.use_wandb:
+            self._setup_wandb()
+    
+    def _setup_model(self):
+        """Initialize the transformer model."""
+        self.model = TransformerLM(
+            vocab_size=self.config.vocab_size,
+            context_length=self.config.context_length,
+            num_layers=self.config.num_layers,
+            d_model=self.config.d_model,
+            num_heads=self.config.num_heads,
+            d_ff=self.config.d_ff,
+            rope_theta=self.config.rope_theta,
+            device=self.device,
+            dtype=self.dtype
+        )
+        
+        # Count parameters
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        
+        logging.info(f"Model initialized with {total_params:,} total parameters")
+        logging.info(f"Trainable parameters: {trainable_params:,}")
+        logging.info(f"Model size: {total_params * 4 / 1024 / 1024:.2f} MB")
+    
+    def _setup_tokenizer(self):
+        """Initialize the tokenizer."""
+        try:
+            self.tokenizer = Tokenizer.from_files(
+                self.config.tokenizer_vocab_path,
+                self.config.tokenizer_merges_path
+            )
+            logging.info(f"Tokenizer loaded with vocab size: {self.tokenizer.vocab_size}")
+        except Exception as e:
+            logging.warning(f"Could not load tokenizer: {e}")
+            self.tokenizer = None
+    
+    def _setup_datasets(self):
+        """Initialize training and validation datasets."""
+        self.train_dataset = MemmapDataset(
+            self.config.train_data_path,
+            self.config.context_length
+        )
+        
+        self.val_dataset = MemmapDataset(
+            self.config.val_data_path,
+            self.config.context_length
+        )
+        
+        # Create data loaders
+        self.train_loader = DataLoader(
+            self.train_dataset,
+            batch_size=self.config.batch_size,
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True
+        )
+        
+        self.val_loader = DataLoader(
+            self.val_dataset,
+            batch_size=self.config.batch_size,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True
+        )
+    
+    def _setup_optimizer(self):
+        """Initialize the optimizer."""
+        self.optimizer = AdamW(
+            self.model.parameters(),
+            lr=self.config.learning_rate,
+            weight_decay=self.config.weight_decay
+        )
+        
+        logging.info(f"Optimizer: AdamW with lr={self.config.learning_rate}, weight_decay={self.config.weight_decay}")
+    
+    def _setup_wandb(self):
+        """Initialize Weights & Biases logging."""
+        wandb.init(
+            project=self.config.wandb_project,
+            name=self.config.wandb_run_name,
+            config=self.config.to_dict(),
+            resume="allow"
+        )
+        logging.info("Weights & Biases logging initialized")
+    
+    def _get_learning_rate(self, step: int) -> float:
+        """Get learning rate for current step using cosine schedule."""
+        if step < self.config.warmup_steps:
+            return self.config.learning_rate * (step / self.config.warmup_steps)
+        else:
+            return cosine_cycle_schedule(
+                step,
+                self.config.warmup_steps,
+                self.config.total_steps,
+                lr_min=self.config.learning_rate * 0.1,
+                lr_max=self.config.learning_rate
+            )
+    
+    def _train_step(self, batch: Tuple[torch.Tensor, torch.Tensor]) -> Dict[str, float]:
+        """Perform a single training step."""
+        inputs, targets = batch
+        inputs = inputs.to(self.device, dtype=torch.long)
+        targets = targets.to(self.device, dtype=torch.long)
+        
+        # Forward pass
+        logits = self.model(inputs)
+        
+        # Calculate loss
+        loss = stable_cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            targets.view(-1)
+        )
+        
+        # Backward pass
+        self.optimizer.zero_grad()
+        loss.backward()
+        
+        # Gradient clipping
+        gradient_clipping(self.model.parameters(), self.config.gradient_clip_norm)
+        
+        # Update learning rate
+        lr = self._get_learning_rate(self.global_step)
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+        
+        self.optimizer.step()
+        
+        # Calculate perplexity
+        perplexity = perplexity_from_loss(loss)
+        
+        return {
+            'loss': loss.item(),
+            'perplexity': perplexity.item(),
+            'learning_rate': lr
+        }
+    
+    def _validate(self) -> Dict[str, float]:
+        """Perform validation."""
+        self.model.eval()
+        total_loss = 0.0
+        total_perplexity = 0.0
+        num_batches = 0
+        
+        with torch.no_grad():
+            for batch in tqdm(self.val_loader, desc="Validating"):
+                inputs, targets = batch
+                inputs = inputs.to(self.device, dtype=torch.long)
+                targets = targets.to(self.device, dtype=torch.long)
+                
+                logits = self.model(inputs)
+                loss = stable_cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    targets.view(-1)
+                )
+                perplexity = perplexity_from_loss(loss)
+                
+                total_loss += loss.item()
+                total_perplexity += perplexity.item()
+                num_batches += 1
+        
+        self.model.train()
+        
+        avg_loss = total_loss / num_batches
+        avg_perplexity = total_perplexity / num_batches
+        
+        return {
+            'val_loss': avg_loss,
+            'val_perplexity': avg_perplexity
+        }
+    
+    def _save_checkpoint(self, is_best: bool = False):
+        """Save model checkpoint."""
+        os.makedirs(self.config.checkpoint_dir, exist_ok=True)
+        
+        checkpoint_path = os.path.join(
+            self.config.checkpoint_dir,
+            f"checkpoint_step_{self.global_step}.pt"
+        )
+        
+        save_checkpoint(
+            self.model,
+            self.optimizer,
+            self.global_step,
+            checkpoint_path
+        )
+        
+        # Save best model
+        if is_best:
+            best_path = os.path.join(self.config.checkpoint_dir, "best_model.pt")
+            save_checkpoint(
+                self.model,
+                self.optimizer,
+                self.global_step,
+                best_path
+            )
+        
+        # Save latest checkpoint
+        latest_path = os.path.join(self.config.checkpoint_dir, "latest.pt")
+        save_checkpoint(
+            self.model,
+            self.optimizer,
+            self.global_step,
+            latest_path
+        )
+    
+    def _log_metrics(self, metrics: Dict[str, float], step: int):
+        """Log metrics to console and W&B."""
+        # Console logging
+        log_str = f"Step {step}: "
+        log_str += ", ".join([f"{k}={v:.4f}" for k, v in metrics.items()])
+        logging.info(log_str)
+        
+        # W&B logging
+        if self.config.use_wandb:
+            wandb.log(metrics, step=step)
+    
+    def train(self):
+        """Main training loop."""
+        logging.info("Starting training...")
+        
+        # Resume from checkpoint if specified
+        if self.config.resume_from:
+            self.global_step = load_checkpoint(
+                self.config.resume_from,
+                self.model,
+                self.optimizer
+            )
+            logging.info(f"Resumed training from step {self.global_step}")
+        
+        # Training loop
+        for epoch in range(self.config.max_epochs):
+            self.epoch = epoch
+            logging.info(f"Starting epoch {epoch + 1}/{self.config.max_epochs}")
+            
+            for batch_idx, batch in enumerate(tqdm(self.train_loader, desc=f"Epoch {epoch + 1}")):
+                # Training step
+                metrics = self._train_step(batch)
+                self.global_step += 1
+                
+                # Logging
+                if self.global_step % self.config.log_interval == 0:
+                    self._log_metrics(metrics, self.global_step)
+                
+                # Validation
+                if self.global_step % self.config.eval_interval == 0:
+                    val_metrics = self._validate()
+                    self._log_metrics(val_metrics, self.global_step)
+                    
+                    # Save best model
+                    if val_metrics['val_loss'] < self.best_val_loss:
+                        self.best_val_loss = val_metrics['val_loss']
+                        self._save_checkpoint(is_best=True)
+                        logging.info(f"New best validation loss: {self.best_val_loss:.4f}")
+                
+                # Checkpointing
+                if self.global_step % self.config.checkpoint_interval == 0:
+                    self._save_checkpoint()
+                
+                # Check if we've reached total steps
+                if self.global_step >= self.config.total_steps:
+                    logging.info(f"Reached total steps ({self.config.total_steps}), stopping training")
+                    break
+            
+            if self.global_step >= self.config.total_steps:
+                break
+        
+        # Final validation and checkpoint
+        logging.info("Training completed. Running final validation...")
+        final_metrics = self._validate()
+        self._log_metrics(final_metrics, self.global_step)
+        self._save_checkpoint()
+        
+        logging.info("Training finished!")
+
+
+def main():
+    """Main entry point."""
+    parser = argparse.ArgumentParser(description="Train CS336 Transformer Language Model")
+    
+    # Configuration options
+    parser.add_argument("--config", type=str, help="Path to configuration JSON file")
+    parser.add_argument("--train-data", type=str, help="Path to training data (.npy)")
+    parser.add_argument("--val-data", type=str, help="Path to validation data (.npy)")
+    parser.add_argument("--vocab-size", type=int, default=50257, help="Vocabulary size")
+    parser.add_argument("--context-length", type=int, default=1024, help="Context length")
+    parser.add_argument("--num-layers", type=int, default=12, help="Number of transformer layers")
+    parser.add_argument("--d-model", type=int, default=768, help="Model dimension")
+    parser.add_argument("--num-heads", type=int, default=12, help="Number of attention heads")
+    parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
+    parser.add_argument("--learning-rate", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--max-epochs", type=int, default=10, help="Maximum number of epochs")
+    parser.add_argument("--total-steps", type=int, default=100000, help="Total training steps")
+    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Checkpoint directory")
+    parser.add_argument("--resume-from", type=str, help="Resume from checkpoint")
+    parser.add_argument("--use-wandb", action="store_true", help="Use Weights & Biases logging")
+    parser.add_argument("--wandb-project", type=str, default="cs336-transformer", help="W&B project name")
+    parser.add_argument("--device", type=str, default="auto", help="Device to use (auto, cuda, cpu)")
+    
+    args = parser.parse_args()
+    
+    # Load configuration
+    if args.config:
+        config = TrainingConfig.from_file(args.config)
+    else:
+        # Create config from command line arguments
+        config_dict = {
+            'vocab_size': args.vocab_size,
+            'context_length': args.context_length,
+            'num_layers': args.num_layers,
+            'd_model': args.d_model,
+            'num_heads': args.num_heads,
+            'batch_size': args.batch_size,
+            'learning_rate': args.learning_rate,
+            'max_epochs': args.max_epochs,
+            'total_steps': args.total_steps,
+            'checkpoint_dir': args.checkpoint_dir,
+            'resume_from': args.resume_from,
+            'use_wandb': args.use_wandb,
+            'wandb_project': args.wandb_project,
+        }
+        
+        if args.train_data:
+            config_dict['train_data_path'] = args.train_data
+        if args.val_data:
+            config_dict['val_data_path'] = args.val_data
+        if args.device != "auto":
+            config_dict['device'] = args.device
+        
+        config = TrainingConfig(**config_dict)
+    
+    # Save configuration
+    os.makedirs(config.checkpoint_dir, exist_ok=True)
+    config.save(os.path.join(config.checkpoint_dir, "config.json"))
+    
+    # Start training
+    trainer = Trainer(config)
+    trainer.train()
+
+
+if __name__ == "__main__":
+    main()
