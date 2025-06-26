@@ -62,10 +62,10 @@ class SwiGLU(nn.Module):
         return self.w2(self.silu(self.w1(x)) * self.w3(x))
 
 class RoPE(nn.Module):
-    def __init__(self, theta: float, d_k: int, max_seq_len: int):
+    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None):
         super().__init__()
-        freqs = 1 / (theta ** (torch.arange(0, d_k, 2)[: (d_k // 2)].float() / d_k))
-        t = torch.arange(max_seq_len, device=freqs.device)
+        freqs = 1 / (theta ** (torch.arange(0, d_k, 2, device=device)[: (d_k // 2)].float() / d_k))
+        t = torch.arange(max_seq_len, device=device)
         freqs_cis = torch.outer(t, freqs)
         self.register_buffer("cos_cache", torch.cos(freqs_cis), persistent=False)
         self.register_buffer("sin_cache", torch.sin(freqs_cis), persistent=False)
@@ -156,21 +156,21 @@ class TransformerLM(nn.Module):
     def __init__(self, vocab_size, context_length, num_layers, d_model, num_heads, d_ff, rope_theta, device=None, dtype=None):
         super().__init__()
         self.token_embeddings = Embedding(vocab_size, d_model, device, dtype)
-        self.rope = RoPE(rope_theta, d_model // num_heads, context_length)
+        self.rope = RoPE(rope_theta, d_model // num_heads, context_length, device)
         self.layers = nn.ModuleList([
             TransformerBlock(d_model, num_heads, d_ff, rope=self.rope, device=device, dtype=dtype) \
                 for _ in range(num_layers)])
         self.ln_final = RMSNorm(d_model, device=device, dtype=dtype)
-        self.lm_head = Linear(d_model, vocab_size, device=device, dtype=dtype)
+        self.device = device
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x.shape: (batch_size, sequence_length)
         seq_len = x.shape[-1]
         x = self.token_embeddings(x)
-        casual_mask = 1 - torch.triu(torch.ones(seq_len, seq_len), diagonal=1)
-        token_positions = torch.arange(seq_len)
+        casual_mask = 1 - torch.triu(torch.ones(seq_len, seq_len, device=self.device), diagonal=1)
+        token_positions = torch.arange(seq_len, device=self.device)
         for layer in self.layers:
             x = layer(x, casual_mask, token_positions)
         x = self.ln_final(x)
-        x = self.lm_head(x)
+        x = x @ self.token_embeddings.weight.T
         return x

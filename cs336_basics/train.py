@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 
@@ -55,7 +56,7 @@ class MemmapDataset(Dataset):
         
         # Load data using memmap for memory efficiency
         self.data = np.load(data_path, mmap_mode='r')
-        self.length = len(self.data) - context_length
+        self.length = (len(self.data) - context_length) // context_length
         
         logging.info(f"Loaded dataset from {data_path}")
         logging.info(f"Dataset size: {len(self.data)} tokens")
@@ -66,8 +67,13 @@ class MemmapDataset(Dataset):
     
     def __getitem__(self, idx):
         # Get input sequence and target sequence
+        idx = idx * self.context_length
         input_seq = self.data[idx:idx + self.context_length]
         target_seq = self.data[idx + 1:idx + self.context_length + 1]
+        
+        # Copy the data to ensure it's writable before converting to tensor
+        input_seq = input_seq.copy()
+        target_seq = target_seq.copy()
         
         return torch.from_numpy(input_seq).long(), torch.from_numpy(target_seq).long()
 
@@ -108,7 +114,6 @@ class TrainingConfig:
         
         # Device and precision
         self.device = kwargs.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
-        self.dtype = kwargs.get('dtype', torch.float32)
         
         # Weights & Biases
         self.use_wandb = kwargs.get('use_wandb', False)
@@ -142,7 +147,6 @@ class Trainer:
     def __init__(self, config: TrainingConfig):
         self.config = config
         self.device = torch.device(config.device)
-        self.dtype = config.dtype
         
         # Setup logging
         logging.basicConfig(
@@ -165,6 +169,13 @@ class Trainer:
         self.epoch = 0
         self.best_val_loss = float('inf')
         
+        # Time tracking for speed calculation
+        self.start_time = time.time()
+        self.last_log_time = time.time()
+        self.total_tokens_processed = 0
+        self.interval_tokens_processed = 0
+        self.last_log_step = 0
+        
         # Setup Weights & Biases
         if config.use_wandb:
             self._setup_wandb()
@@ -180,7 +191,7 @@ class Trainer:
             d_ff=self.config.d_ff,
             rope_theta=self.config.rope_theta,
             device=self.device,
-            dtype=self.dtype
+            dtype=torch.float32
         )
         
         # Count parameters
@@ -270,6 +281,10 @@ class Trainer:
         inputs, targets = batch
         inputs = inputs.to(self.device, dtype=torch.long)
         targets = targets.to(self.device, dtype=torch.long)
+        
+        # Update token count for speed calculation
+        self.total_tokens_processed += inputs.numel()
+        self.interval_tokens_processed += inputs.numel()
         
         # Forward pass
         logits = self.model(inputs)
@@ -374,18 +389,73 @@ class Trainer:
     
     def _log_metrics(self, metrics: Dict[str, float], step: int):
         """Log metrics to console and W&B."""
-        # Console logging
+        current_time = time.time()
+        
+        # Calculate speed and time estimates
+        elapsed_time = current_time - self.start_time
+        interval_time = current_time - self.last_log_time
+        tokens_per_second = self.interval_tokens_processed / interval_time if elapsed_time > 0 else 0
+        
+        # Calculate estimated remaining time
+        if step > 0:
+            steps_remaining = self.config.total_steps - step
+            avg_time_per_step = elapsed_time / step
+            estimated_remaining_time = steps_remaining * avg_time_per_step
+        else:
+            estimated_remaining_time = 0
+        
+        # Format time strings
+        def format_time(seconds):
+            if seconds < 60:
+                return f"{seconds:.1f}s"
+            elif seconds < 3600:
+                minutes = seconds / 60
+                return f"{minutes:.1f}m"
+            else:
+                hours = seconds / 3600
+                return f"{hours:.1f}h"
+        
+        # Add speed and time metrics
+        speed_metrics = {
+            'tokens_per_sec': tokens_per_second,
+            'elapsed_time': format_time(elapsed_time),
+            'estimated_remaining': format_time(estimated_remaining_time)
+        }
+        
+        # Console logging with speed info
         log_str = f"Step {step}: "
         log_str += ", ".join([f"{k}={v:.4f}" for k, v in metrics.items()])
+        log_str += f" | Speed: {tokens_per_second:.1f} tokens/sec"
+        log_str += f" | Elapsed: {speed_metrics['elapsed_time']}"
+        log_str += f" | ETA: {speed_metrics['estimated_remaining']}"
         logging.info(log_str)
         
-        # W&B logging
+        # Update last log time
+        self.last_log_time = current_time
+        self.interval_tokens_processed = 0
+        self.last_log_step = step
+        
+        # W&B logging (include speed metrics)
         if self.config.use_wandb:
-            wandb.log(metrics, step=step)
+            wandb_metrics = {**metrics, 'tokens_per_sec': tokens_per_second}
+            wandb.log(wandb_metrics, step=step)
     
     def train(self):
         """Main training loop."""
         logging.info("Starting training...")
+        
+        # Calculate expected training statistics
+        data_steps = self.config.max_epochs * len(self.train_dataset) // self.config.batch_size
+        total_tokens = self.config.total_steps * self.config.batch_size * self.config.context_length
+        logging.info(f"Training configuration:")
+        logging.info(f"  - Max Total steps: {self.config.total_steps:,}")
+        logging.info(f"  - Data steps: {data_steps:,}")
+        logging.info(f"  - Batch size: {self.config.batch_size}")
+        logging.info(f"  - Context length: {self.config.context_length}")
+        logging.info(f"  - Total tokens to process: {total_tokens:,}")
+        logging.info(f"  - Log interval: {self.config.log_interval} steps")
+        logging.info(f"  - Eval interval: {self.config.eval_interval} steps")
+        logging.info(f"  - Checkpoint interval: {self.config.checkpoint_interval} steps")
         
         # Resume from checkpoint if specified
         if self.config.resume_from:
@@ -401,7 +471,7 @@ class Trainer:
             self.epoch = epoch
             logging.info(f"Starting epoch {epoch + 1}/{self.config.max_epochs}")
             
-            for batch_idx, batch in enumerate(tqdm(self.train_loader, desc=f"Epoch {epoch + 1}")):
+            for batch_idx, batch in enumerate(self.train_loader):
                 # Training step
                 metrics = self._train_step(batch)
                 self.global_step += 1
@@ -439,7 +509,16 @@ class Trainer:
         self._log_metrics(final_metrics, self.global_step)
         self._save_checkpoint()
         
+        # Final training statistics
+        total_time = time.time() - self.start_time
+        final_tokens_per_sec = self.total_tokens_processed / total_time if total_time > 0 else 0
         logging.info("Training finished!")
+        logging.info(f"Final statistics:")
+        logging.info(f"  - Total training time: {total_time/3600:.2f} hours")
+        logging.info(f"  - Total tokens processed: {self.total_tokens_processed:,}")
+        logging.info(f"  - Average speed: {final_tokens_per_sec:.1f} tokens/sec")
+        logging.info(f"  - Final validation loss: {final_metrics['val_loss']:.4f}")
+        logging.info(f"  - Final validation perplexity: {final_metrics['val_perplexity']:.4f}")
 
 
 def main():
