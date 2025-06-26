@@ -193,6 +193,7 @@ class Trainer:
             device=self.device,
             dtype=torch.float32
         )
+        self.model = torch.compile(self.model)
         
         # Count parameters
         total_params = sum(p.numel() for p in self.model.parameters())
