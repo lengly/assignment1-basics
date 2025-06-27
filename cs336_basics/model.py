@@ -153,7 +153,7 @@ class TransformerBlock(nn.Module):
         return x
 
 class TransformerLM(nn.Module):
-    def __init__(self, vocab_size, context_length, num_layers, d_model, num_heads, d_ff, rope_theta, device=None, dtype=None):
+    def __init__(self, vocab_size, context_length, num_layers, d_model, num_heads, d_ff, rope_theta, device=None, dtype=None, shared_lm_head=False):
         super().__init__()
         self.token_embeddings = Embedding(vocab_size, d_model, device, dtype)
         self.rope = RoPE(rope_theta, d_model // num_heads, context_length, device)
@@ -161,6 +161,10 @@ class TransformerLM(nn.Module):
             TransformerBlock(d_model, num_heads, d_ff, rope=self.rope, device=device, dtype=dtype) \
                 for _ in range(num_layers)])
         self.ln_final = RMSNorm(d_model, device=device, dtype=dtype)
+        if shared_lm_head:
+            self.lm_head = None
+        else:
+            self.lm_head = Linear(d_model, vocab_size, device=device, dtype=dtype)
         self.device = device
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -172,5 +176,8 @@ class TransformerLM(nn.Module):
         for layer in self.layers:
             x = layer(x, casual_mask, token_positions)
         x = self.ln_final(x)
-        x = x @ self.token_embeddings.weight.T
+        if self.lm_head != None:
+            x = self.lm_head(x)
+        else:
+            x = x @ self.token_embeddings.weight.T
         return x

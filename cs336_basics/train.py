@@ -24,7 +24,11 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 import wandb
-from tqdm import tqdm
+
+# Mixed precision training imports
+from torch.amp import autocast
+from torch.cuda.amp import GradScaler
+# torch.set_float32_matmul_precision('high')
 
 from .model import TransformerLM
 from .tokenizer import Tokenizer
@@ -114,6 +118,8 @@ class TrainingConfig:
         
         # Device and precision
         self.device = kwargs.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
+        self.use_mixed_precision = kwargs.get('use_mixed_precision', False)
+        self.mixed_precision_dtype = kwargs.get('mixed_precision_dtype', 'bfloat16')
         
         # Weights & Biases
         self.use_wandb = kwargs.get('use_wandb', False)
@@ -176,6 +182,9 @@ class Trainer:
         self.interval_tokens_processed = 0
         self.last_log_step = 0
         
+        # Setup mixed precision training
+        self._setup_mixed_precision()
+        
         # Setup Weights & Biases
         if config.use_wandb:
             self._setup_wandb()
@@ -191,7 +200,8 @@ class Trainer:
             d_ff=self.config.d_ff,
             rope_theta=self.config.rope_theta,
             device=self.device,
-            dtype=torch.float32
+            dtype=torch.float32,
+            shared_lm_head=True
         )
         self.model = torch.compile(self.model)
         
@@ -254,6 +264,25 @@ class Trainer:
         
         logging.info(f"Optimizer: AdamW with lr={self.config.learning_rate}, weight_decay={self.config.weight_decay}")
     
+    def _setup_mixed_precision(self):
+        """Setup mixed precision training."""
+        if self.config.use_mixed_precision and self.device.type == 'cuda':
+            self.scaler = GradScaler()
+            if self.config.mixed_precision_dtype == 'float16':
+                self.autocast_dtype = torch.float16
+            elif self.config.mixed_precision_dtype == 'bfloat16':
+                self.autocast_dtype = torch.bfloat16
+            else:
+                logging.warning(f"Unknown mixed precision dtype: {self.config.mixed_precision_dtype}, using float16")
+                self.autocast_dtype = torch.float16
+            
+            logging.info(f"Mixed precision training enabled with dtype: {self.config.mixed_precision_dtype}")
+        else:
+            self.scaler = None
+            self.autocast_dtype = None
+            if self.config.use_mixed_precision and self.device.type != 'cuda':
+                logging.warning("Mixed precision training requires CUDA device, disabling")
+    
     def _setup_wandb(self):
         """Initialize Weights & Biases logging."""
         wandb.init(
@@ -287,28 +316,46 @@ class Trainer:
         self.total_tokens_processed += inputs.numel()
         self.interval_tokens_processed += inputs.numel()
         
-        # Forward pass
-        logits = self.model(inputs)
+        # Forward pass with mixed precision if enabled
+        if self.scaler is not None:
+            with autocast(device_type='cuda', dtype=self.autocast_dtype):
+                logits = self.model(inputs)
+                loss = stable_cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    targets.view(-1)
+                )
+        else:
+            logits = self.model(inputs)
+            loss = stable_cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1)
+            )
         
-        # Calculate loss
-        loss = stable_cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            targets.view(-1)
-        )
-        
-        # Backward pass
+        # Backward pass with gradient scaling if mixed precision is enabled
         self.optimizer.zero_grad()
-        loss.backward()
+        if self.scaler is not None:
+            self.scaler.scale(loss).backward()
+        else:
+            loss.backward()
         
         # Gradient clipping
-        gradient_clipping(self.model.parameters(), self.config.gradient_clip_norm)
+        if self.scaler is not None:
+            self.scaler.unscale_(self.optimizer)
+            gradient_clipping(self.model.parameters(), self.config.gradient_clip_norm)
+        else:
+            gradient_clipping(self.model.parameters(), self.config.gradient_clip_norm)
         
         # Update learning rate
         lr = self._get_learning_rate(self.global_step)
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
         
-        self.optimizer.step()
+        # Optimizer step with gradient scaling
+        if self.scaler is not None:
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            self.optimizer.step()
         
         # Calculate perplexity
         perplexity = perplexity_from_loss(loss)
@@ -327,16 +374,26 @@ class Trainer:
         num_batches = 0
         
         with torch.no_grad():
-            for batch in tqdm(self.val_loader, desc="Validating"):
+            for batch in self.val_loader:
                 inputs, targets = batch
                 inputs = inputs.to(self.device, dtype=torch.long)
                 targets = targets.to(self.device, dtype=torch.long)
                 
-                logits = self.model(inputs)
-                loss = stable_cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    targets.view(-1)
-                )
+                # Use autocast for validation if mixed precision is enabled
+                if self.scaler is not None:
+                    with autocast(device_type='cuda', dtype=self.autocast_dtype):
+                        logits = self.model(inputs)
+                        loss = stable_cross_entropy(
+                            logits.view(-1, logits.size(-1)),
+                            targets.view(-1)
+                        )
+                else:
+                    logits = self.model(inputs)
+                    loss = stable_cross_entropy(
+                        logits.view(-1, logits.size(-1)),
+                        targets.view(-1)
+                    )
+                
                 perplexity = perplexity_from_loss(loss)
                 
                 total_loss += loss.item()
@@ -362,31 +419,30 @@ class Trainer:
             f"checkpoint_step_{self.global_step}.pt"
         )
         
-        save_checkpoint(
-            self.model,
-            self.optimizer,
-            self.global_step,
-            checkpoint_path
-        )
+        # Prepare checkpoint data
+        checkpoint_data = {
+            'iteration': self.global_step,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+        }
+        
+        # Add gradient scaler state if using mixed precision
+        if self.scaler is not None:
+            checkpoint_data['scaler_state_dict'] = self.scaler.state_dict()
+        
+        torch.save(checkpoint_data, checkpoint_path)
+        print(f"Saved checkpoint to {checkpoint_path}")
         
         # Save best model
         if is_best:
             best_path = os.path.join(self.config.checkpoint_dir, "best_model.pt")
-            save_checkpoint(
-                self.model,
-                self.optimizer,
-                self.global_step,
-                best_path
-            )
+            torch.save(checkpoint_data, best_path)
+            print(f"Saved best model to {best_path}")
         
         # Save latest checkpoint
         latest_path = os.path.join(self.config.checkpoint_dir, "latest.pt")
-        save_checkpoint(
-            self.model,
-            self.optimizer,
-            self.global_step,
-            latest_path
-        )
+        torch.save(checkpoint_data, latest_path)
+        print(f"Saved latest checkpoint to {latest_path}")
     
     def _log_metrics(self, metrics: Dict[str, float], step: int):
         """Log metrics to console and W&B."""
@@ -460,11 +516,16 @@ class Trainer:
         
         # Resume from checkpoint if specified
         if self.config.resume_from:
-            self.global_step = load_checkpoint(
-                self.config.resume_from,
-                self.model,
-                self.optimizer
-            )
+            checkpoint = torch.load(self.config.resume_from, map_location=self.device)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.global_step = checkpoint['iteration']
+            
+            # Load gradient scaler state if using mixed precision
+            if self.scaler is not None and 'scaler_state_dict' in checkpoint:
+                self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+                logging.info("Loaded gradient scaler state from checkpoint")
+            
             logging.info(f"Resumed training from step {self.global_step}")
         
         # Training loop
@@ -544,6 +605,9 @@ def main():
     parser.add_argument("--use-wandb", action="store_true", help="Use Weights & Biases logging")
     parser.add_argument("--wandb-project", type=str, default="cs336-transformer", help="W&B project name")
     parser.add_argument("--device", type=str, default="auto", help="Device to use (auto, cuda, cpu)")
+    parser.add_argument("--use-mixed-precision", action="store_true", help="Enable mixed precision training")
+    parser.add_argument("--mixed-precision-dtype", type=str, default="bfloat16", 
+                       choices=["float16", "bfloat16"], help="Mixed precision dtype")
     
     args = parser.parse_args()
     
@@ -566,6 +630,8 @@ def main():
             'resume_from': args.resume_from,
             'use_wandb': args.use_wandb,
             'wandb_project': args.wandb_project,
+            'use_mixed_precision': args.use_mixed_precision,
+            'mixed_precision_dtype': args.mixed_precision_dtype,
         }
         
         if args.train_data:
